@@ -6,7 +6,7 @@ A GenLayer Intelligent Contract for **Performance-based Contracting** — payout
 
 | Concern | How it's handled |
 |---|---|
-| Fund-liveness (no locked stakes) | `expire_task` can void **any** non-terminal task (`open`, `in_progress`, `partial`, `rejected`) after the deadline passes. Once expired, evidence is frozen and the task cannot be resubmitted or reverified — funds are never permanently locked. Terminal states (`expired`, `settled`) are immutable. |
+| Fund-liveness (no locked stakes) | `expire_task` can void **any** non-terminal task (`open`, `in_progress`, `partial`, `rejected`) after the deadline passes. Once expired, evidence is frozen and the task cannot be resubmitted or reverified — funds are atomically refunded to the sponsor via `_EOA(sponsor).emit_transfer(reward)`. Terminal states (`expired`, `settled`) are immutable. |
 | Evidence freezing | Once `verify_performance` runs, the submission's `evidence_frozen` flag is set to `True`. `resubmit_deliverable` explicitly checks this flag and reverts if frozen — deliverable URLs cannot be replaced after verification. `expire_task` also freezes evidence on the submission. |
 | Terminal evaluation finality | `reverify_task` is restricted to `partial` or `rejected` tasks only. A `verified` task (payment eligible) or `settled` task (paid) cannot be reopened — the sponsor cannot retroactively change a verification outcome after payment is released. |
 | Validator criteria-ratio consistency | The validator does not just check that `decision` and `confidence` match within tolerance — it also enforces that the **criteria counts are consistent with the stated decision**: `pass` requires `met ≥ unmet` and `met > 0`; `fail` requires `unmet > met`; `partial` requires both `met > 0` and `unmet > 0`. The same checks run deterministically post-consensus before writing to storage. |
@@ -47,6 +47,7 @@ Verification
   criteria_unmet:       DynArray[str]
   reasoning:            str
   verified_by:          Address
+  evidence_hash:        bytes      # Keccak256 hash of evidence content for content-addressing
 
 TaskSettlement
   sponsor:              Address
@@ -68,9 +69,12 @@ create_task(sponsor) ──► task-0 [open]
 
 verify_performance(task-0)    (anyone can trigger; consensus runs)
       │
-      ├── "pass"   ──► task-0 [verified], submission-0 [verified], evidence_frozen = True
+      ├── "pass"   ──► task-0 [verified], submission-0 [verified], evidence_frozen = True, evidence_hash = keccak256(content)
       │                    │
-      │                    └── release_payment(task-0)  (sponsor only)
+      │                    ├── release_payment(task-0)  (sponsor only)
+      │                    │       └─► task-0 [settled]; _EOA(worker).emit_transfer(reward)
+      │                    │
+      │                    └── claim_reward(task-0)    (worker only)
       │                            └─► task-0 [settled]; _EOA(worker).emit_transfer(reward)
       │
       ├── "partial" ──► task-0 [partial], submission-0 [partial], evidence_frozen = True
@@ -86,7 +90,7 @@ verify_performance(task-0)    (anyone can trigger; consensus runs)
                            └── reject_submission(task-0)  (sponsor only; confirms rejection)
 
 expire_task(task-0)   (anyone; requires deadline passed; works on open/in_progress/partial/rejected)
-      └─► task-0 [expired], evidence_frozen = True
+      └─► task-0 [expired], evidence_frozen = True, atomic refund: _EOA(sponsor).emit_transfer(reward)
 ```
 
 ## Public interface
@@ -100,18 +104,19 @@ Sponsor side:
 Worker side:
 - `submit_deliverable(task_id, deliverable_url, summary) — assigned worker only, before deadline; sets task to `in_progress`.
 - `resubmit_deliverable(task_id, deliverable_url, summary) — worker only, task must be `rejected`, evidence must not be frozen, before deadline; clears old verification.
+- `claim_reward(task_id) -> u256` — worker only, task must be `verified`; atomically pays the worker and sets task to `settled`. Enables atomic claim without sponsor action.
 
 Public triggers:
-- `verify_performance(task_id) -> dict` — anyone can call; runs the AI consensus verification. Task must be `in_progress` or `rejected`.
+- `verify_performance(task_id) -> dict` — anyone can call; runs the AI consensus verification. Task must be `in_progress` or `rejected`. Verification record now stores `evidence_hash` (Keccak256 of evidence content) for content-addressing.
 
 Lifecycle:
-- `expire_task(task_id) — anyone can call after deadline; works on any non-terminal state (`open`, `in_progress`, `partial`, `rejected`); freezes evidence.
+- `expire_task(task_id) -> u256` — anyone can call after deadline; works on any non-terminal state (`open`, `in_progress`, `partial`, `rejected`); freezes evidence; atomically refunds sponsor via `_EOA(sponsor).emit_transfer(reward)`.
 
 Views:
 - `get_task_count() -> i32`, `get_submission_count() -> i32`
 - `get_task_status(task_id) -> str`, `get_task_reward(task_id) -> u256`, `get_task_title(task_id) -> str`, `get_task_description(task_id) -> str`, `get_task_criteria(task_id) -> str`, `get_task_deadline(task_id) -> u256`, `get_task_is_expired(task_id) -> bool`
 - `get_submission_status(task_id) -> str`, `get_submission_deliverable_url(task_id) -> str`, `get_submission_evidence_frozen(task_id) -> bool`
-- `get_verification_decision(task_id) -> str`, `get_verification_decision_dict(task_id) -> dict`
+- `get_verification_decision(task_id) -> str`, `get_verification_decision_dict(task_id) -> dict`, `get_verification_evidence_hash(task_id) -> str`
 
 ## The consensus block (the interesting part)
 
@@ -137,19 +142,20 @@ The failure mode is biased toward **not paying**: divergent decisions, confidenc
 
 | Network | Address | Explorer |
 |---|---|---|
-| Studio | `0x36cD20BC483cAD040BbD87e230B6462E0b39de71` | [View on Explorer](https://explorer-studio.genlayer.com/address/0x36cD20BC483cAD040BbD87e230B6462E0b39de71) |
+| Studio | `0x1855A1E90523361B44728544a7CBd09E7336d4eB` | [View on Explorer](https://explorer-studio.genlayer.com/address/0x1855A1E90523361B44728544a7CBd09E7336d4eB) |
 
 ## Testing
 
-36 direct-mode tests covering all write and view methods:
+41 direct-mode tests covering all write and view methods:
 
 - **Task lifecycle**: create, create multiple, empty title revert, zero reward revert, non-sponsor create revert
 - **Submission**: submit deliverable, unauthorized worker revert, double submit revert, deadline revert, non-worker revert, submission count
-- **Verification**: pass/partial/fail outcomes, double verify revert, verify without submission revert
+- **Verification**: pass/partial/fail outcomes, double verify revert, verify without submission revert, evidence hash stored
 - **Payment**: full release flow, not-yet-verified revert, wrong-sponsor revert, settled-task-expire revert
+- **Claim reward**: full flow, non-worker revert, not-verified revert
 - **Resubmission**: reject → resubmit flow, resubmit with frozen evidence revert
 - **Reverification**: partial task reverify, rejected task reverify, verified-task reverify revert, open-task reverify revert
-- **Expiry**: deadline revert, expire settled task revert, expire in_progress task, expire partial task
+- **Expiry**: deadline revert, expire settled task revert, expire in_progress task, expire partial task, atomic refund verification
 - **Views**: all 14 view methods tested, verification dict output
 
 ```bash
@@ -164,7 +170,7 @@ pytest tests/direct/ -v
 - Payment is released in the same transaction that the sponsor calls `release_payment`. A composing contract could add a dispute window or multi-sig approval on top.
 - The model is shared: the LLM evaluates both leader and validator prompts from the same model, so multi-source-style cross-checking is simulated through independent prompt runs, not truly independent sources.
 - No partial payout: a `partial` decision does not automatically release a fraction of the reward. The sponsor must either reverify, reject (allowing resubmission), or wait for expiry.
-- `expire_task` does not automatically return funds — it only marks the task as expired. A composing contract could add automatic refund logic on top.
+- `evidence_hash` is computed from the raw HTML/text content of the deliverable URL. If the same content is hosted at different URLs, the hashes will match — but if the content changes at the same URL (dynamic page), the hash reflects the state at verification time.
 
 ## Dependency pin
 
