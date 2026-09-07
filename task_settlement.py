@@ -196,6 +196,7 @@ class VerificationData:
     criteria_unmet: DynArray[str]
     reasoning: str
     verified_by: Address
+    evidence_hash: bytes
 
     def __init__(
         self,
@@ -206,6 +207,7 @@ class VerificationData:
         criteria_unmet: DynArray[str],
         reasoning: str,
         verified_by: Address,
+        evidence_hash: bytes,
     ):
         self.task_id = task_id
         self.decision = decision
@@ -214,6 +216,7 @@ class VerificationData:
         self.criteria_unmet = criteria_unmet
         self.reasoning = reasoning
         self.verified_by = verified_by
+        self.evidence_hash = evidence_hash
 
     def as_dict(self) -> dict:
         return {
@@ -224,6 +227,7 @@ class VerificationData:
             "criteria_unmet": self.criteria_unmet,
             "reasoning": self.reasoning,
             "verified_by": str(self.verified_by),
+            "evidence_hash": self.evidence_hash.hex(),
         }
 
 
@@ -333,6 +337,13 @@ class TaskSettlement(gl.Contract):
         return ver.as_dict()
 
     @gl.public.view
+    def get_verification_evidence_hash(self, task_id: str) -> str:
+        ver = self.verifications.get(task_id)
+        if ver is None:
+            return ""
+        return ver.evidence_hash.hex()
+
+    @gl.public.view
     def get_contract_balance(self) -> u256:
         return self.balance
 
@@ -431,6 +442,7 @@ class TaskSettlement(gl.Contract):
 
             prompt = _build_verification_prompt(title, description, criteria, evidence_text)
             result = gl.nondet.exec_prompt(prompt, response_format="json")
+            result["evidence_hash"] = Keccak256(evidence_text.encode("utf-8")).hexdigest()
             return result
 
         def validator_fn(leader_result) -> bool:
@@ -445,8 +457,15 @@ class TaskSettlement(gl.Contract):
             if not _validate_verification_fields(parsed_leader):
                 return False
 
+            if "evidence_hash" not in leader_data or not isinstance(leader_data["evidence_hash"], str):
+                return False
+
             validator_response = gl.nondet.web.get(deliverable_url)
             validator_text = validator_response.body.decode("utf-8")
+
+            validator_hash = Keccak256(validator_text.encode("utf-8")).hexdigest()
+            if validator_hash != leader_data["evidence_hash"]:
+                return False
 
             validator_prompt = _build_verification_prompt(title, description, criteria, validator_text)
             validator_result = gl.nondet.exec_prompt(validator_prompt, response_format="json")
@@ -490,6 +509,9 @@ class TaskSettlement(gl.Contract):
         parsed_result = _parse_json_result(result)
         assert parsed_result is not None, "Failed to parse verification result"
         assert _validate_verification_fields(parsed_result), "Invalid verification fields"
+        assert "evidence_hash" in result, "Missing evidence hash"
+
+        evidence_hash_bytes = bytes.fromhex(result["evidence_hash"])
 
         n_met = len(parsed_result["criteria_met"])
         n_unmet = len(parsed_result["criteria_unmet"])
@@ -511,6 +533,7 @@ class TaskSettlement(gl.Contract):
             parsed_result["criteria_unmet"],
             parsed_result["reasoning"],
             gl.message.sender_address,
+            evidence_hash_bytes,
         )
         self.verifications[task_id] = ver_data
 
@@ -547,6 +570,22 @@ class TaskSettlement(gl.Contract):
         return reward
 
     @gl.public.write
+    def claim_reward(self, task_id: str) -> u256:
+        """Worker claims reward directly after verification. No sponsor cooperation needed."""
+        task_id = str(task_id)
+        task = self.tasks.get(task_id)
+        assert task is not None, "Task does not exist"
+        assert task.status == "verified", "Task is not verified"
+        assert gl.message.sender_address == task.worker, "Only the assigned worker can claim"
+
+        reward = task.reward
+        task.status = "settled"
+
+        _EOA(task.worker).emit_transfer(value=reward)
+
+        return reward
+
+    @gl.public.write
     def reject_submission(self, task_id: str) -> None:
         task_id = str(task_id)
         task = self.tasks.get(task_id)
@@ -566,7 +605,8 @@ class TaskSettlement(gl.Contract):
         sub.evidence_frozen = False
 
     @gl.public.write
-    def expire_task(self, task_id: str) -> None:
+    def expire_task(self, task_id: str) -> u256:
+        """Expire a task and atomically refund the escrow to the sponsor."""
         task_id = str(task_id)
         task = self.tasks.get(task_id)
         assert task is not None, "Task does not exist"
@@ -576,11 +616,16 @@ class TaskSettlement(gl.Contract):
         now = _current_timestamp()
         assert now > task.deadline, "Task deadline has not passed yet"
 
+        reward = task.reward
         task.status = "expired"
 
         sub = self.submissions.get(task_id)
         if sub is not None:
             sub.evidence_frozen = True
+
+        _EOA(task.sponsor).emit_transfer(value=reward)
+
+        return reward
 
     @gl.public.write
     def resubmit_deliverable(
